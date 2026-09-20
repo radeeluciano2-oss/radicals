@@ -1,0 +1,29 @@
+{
+  "name": "chenie-voice-v4",
+  "private": true,
+  "version": "0.4.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"node --watch server/server.js\"",
+    "build": "vite build",
+    "start": "node server/server.js",
+    "smoke": "node tests/smoke-check.mjs",
+    "smoke:production": "APP_URL=$APP_URL node tests/smoke-check.mjs",
+    "validate:env": "node scripts/validate-env.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "concurrently": "^9.0.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.4.1",
+    "openai": "^4.67.3",
+    "stripe": "^17.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.3",
+    "vite": "^5.4.10",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

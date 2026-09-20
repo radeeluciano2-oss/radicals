@@ -1,0 +1,256 @@
+import "dotenv/config";
+import express from "express";
+import rateLimit from "express-rate-limit";
+import { createClient } from "@supabase/supabase-js";
+import OpenAI from "openai";
+import Stripe from "stripe";
+import { createClient } from "@supabase/supabase-js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const app = express();
+app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  next();
+});
+const port = Number(process.env.PORT || 8787);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const root = path.join(__dirname, "..");
+
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const supabaseAdmin = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+
+const ttsLimiter = rateLimit({ windowMs: 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, service: "chenie-voice", version: "0.4.0" });
+});
+
+app.get("/api/config", (_req, res) => {
+  res.json({
+    ttsConfigured: Boolean(openai),
+    authConfigured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY),
+    billingConfigured: Boolean(stripe),
+    databaseConfigured: Boolean(supabaseAdmin)
+  });
+});
+
+
+const supabaseAuth = process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
+  : null;
+
+async function requireUser(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token || !supabaseAuth) return res.status(401).json({ error: "Sign in required." });
+  const { data, error } = await supabaseAuth.auth.getUser(token);
+  if (error || !data?.user) return res.status(401).json({ error: "Invalid session." });
+  req.user = data.user;
+  next();
+}
+
+function validateTtsBody(body) {
+  const text = typeof body?.text === "string" ? body.text.trim() : "";
+  const voice = typeof body?.voice === "string" ? body.voice : "alloy";
+  const speed = Number(body?.speed || 1);
+  const allowedVoices = new Set(["alloy", "ash", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"]);
+  if (!text) return { error: "Please enter a script." };
+  if (text.length > 5000) return { error: "Maximum script length is 5,000 characters." };
+  if (!allowedVoices.has(voice)) return { error: "Unsupported voice." };
+  if (!Number.isFinite(speed) || speed < 0.25 || speed > 4) return { error: "Speed must be between 0.25 and 4." };
+  return { text, voice, speed };
+}
+
+
+async function checkAndRecordUsage(userId, characterCount, voice, speed) {
+  if (!supabaseAdmin) return { allowed: true, skipped: true };
+  const { data, error } = await supabaseAdmin.rpc("reserve_characters", {
+    p_user_id: userId,
+    p_character_count: characterCount,
+    p_voice: voice,
+    p_speed: speed
+  });
+  if (error) throw error;
+  return data;
+}
+
+app.post("/api/tts", ttsLimiter, express.json({ limit: "100kb" }), requireUser, async (req, res) => {
+  const input = validateTtsBody(req.body);
+  if (input.error) return res.status(400).json({ error: input.error });
+  if (!openai) return res.status(503).json({ error: "TTS is not configured. Add OPENAI_API_KEY." });
+  try {
+    const usage = await checkAndRecordUsage(req.user.id, input.text.length, input.voice, input.speed);
+    if (!usage.allowed) return res.status(402).json({ error: "Character limit reached.", usage });
+  } catch (error) {
+    console.error("Usage check error:", error);
+    return res.status(500).json({ error: "Unable to verify account usage." });
+  }
+
+  try {
+    const speech = await openai.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice: input.voice,
+      input: input.text,
+      speed: input.speed,
+      response_format: "mp3"
+    });
+    const buffer = Buffer.from(await speech.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Disposition", 'attachment; filename="chenie-voice.mp3"');
+    return res.send(buffer);
+  } catch (error) {
+    console.error("TTS error:", error);
+    return res.status(500).json({ error: "Voice generation failed." });
+  }
+});
+
+
+
+app.get("/api/history", requireUser, async (req, res) => {
+  if (!supabaseAdmin) return res.json({ generations: [] });
+  const { data, error } = await supabaseAdmin.from("generations")
+    .select("id, character_count, voice, speed, created_at")
+    .eq("user_id", req.user.id).order("created_at", { ascending: false }).limit(50);
+  if (error) return res.status(500).json({ error: "Unable to load history." });
+  res.json({ generations: data || [] });
+});
+
+app.get("/api/usage", requireUser, async (req, res) => {
+  if (!supabaseAdmin) return res.json({ configured: false });
+  const { data, error } = await supabaseAdmin.from("profiles")
+    .select("plan, character_limit, characters_used").eq("id", req.user.id).single();
+  if (error) return res.status(500).json({ error: "Unable to load usage." });
+  res.json({ configured: true, ...data, remaining: Math.max(0, Number(data.character_limit) - Number(data.characters_used)) });
+});
+
+
+app.post("/api/billing-portal", express.json(), requireUser, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Billing is not configured." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database is not configured." });
+
+  const { data: profile, error } = await supabaseAdmin.from("profiles")
+    .select("stripe_customer_id").eq("id", req.user.id).single();
+
+  if (error || !profile?.stripe_customer_id) {
+    return res.status(400).json({ error: "No billing profile found for this account." });
+  }
+
+  try {
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: profile.stripe_customer_id,
+      return_url: process.env.APP_URL || "http://localhost:5173"
+    });
+    return res.json({ url: portal.url });
+  } catch (error) {
+    console.error("Billing portal error:", error);
+    return res.status(500).json({ error: "Unable to open billing portal." });
+  }
+});
+
+app.post("/api/checkout", express.json(), requireUser, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Billing is not configured." });
+  const priceId = req.body?.priceId;
+  const plan = process.env.STRIPE_PRICE_CREATOR === priceId ? "creator" : "starter";
+  const characterLimit = plan === "creator" ? 100000 : 25000;
+  if (!priceId || !["STRIPE_PRICE_STARTER", "STRIPE_PRICE_CREATOR"].some(k => process.env[k] === priceId)) {
+    return res.status(400).json({ error: "Invalid price." });
+  }
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${process.env.APP_URL || "http://localhost:5173"}/?billing=success`,
+      cancel_url: `${process.env.APP_URL || "http://localhost:5173"}/?billing=cancelled`,
+      metadata: { user_id: req.user.id, plan, character_limit: String(characterLimit) }
+    });
+    return res.json({ url: session.url });
+  } catch (error) {
+    console.error("Checkout error:", error);
+    return res.status(500).json({ error: "Unable to start checkout." });
+  }
+});
+
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return res.status(503).send("Webhook not configured.");
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
+    if (supabaseAdmin) {
+      const { data: existing } = await supabaseAdmin.from("stripe_events")
+        .select("event_id").eq("event_id", event.id).maybeSingle();
+      if (existing) return res.json({ received: true, duplicate: true });
+      const { error: eventInsertError } = await supabaseAdmin.from("stripe_events")
+        .insert({ event_id: event.id, event_type: event.type });
+      if (eventInsertError) throw eventInsertError;
+    }
+    console.log("Stripe event received:", event.type);
+    if (supabaseAdmin && event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const userId = session.metadata?.user_id;
+      if (userId) {
+        await supabaseAdmin.from("profiles").update({
+          plan: session.metadata?.plan || "starter",
+          stripe_customer_id: session.customer || null,
+          stripe_subscription_id: session.subscription || null,
+          character_limit: session.metadata?.character_limit ? Number(session.metadata.character_limit) : 25000,
+          updated_at: new Date().toISOString()
+        }).eq("id", userId);
+      }
+    }
+    if (supabaseAdmin && event.type === "customer.subscription.deleted") {
+      const subscription = event.data.object;
+      await supabaseAdmin.from("profiles").update({
+        plan: "free",
+        character_limit: Number(process.env.MONTHLY_FREE_CHARACTERS || 5000),
+        stripe_subscription_id: null,
+        updated_at: new Date().toISOString()
+      }).eq("stripe_subscription_id", subscription.id);
+    }
+    if (supabaseAdmin && ["customer.subscription.updated", "customer.subscription.created"].includes(event.type)) {
+      const subscription = event.data.object;
+      const active = ["active", "trialing"].includes(subscription.status);
+      await supabaseAdmin.from("profiles").update({
+        plan: active ? "paid" : "free",
+        stripe_customer_id: subscription.customer || null,
+        stripe_subscription_id: subscription.id,
+        character_limit: active ? 25000 : Number(process.env.MONTHLY_FREE_CHARACTERS || 5000),
+        updated_at: new Date().toISOString()
+      }).eq("stripe_customer_id", subscription.customer);
+    }
+    if (supabaseAdmin && event.type === "invoice.payment_failed") {
+      const invoice = event.data.object;
+      await supabaseAdmin.from("profiles").update({
+        plan: "payment_failed",
+        updated_at: new Date().toISOString()
+      }).eq("stripe_customer_id", invoice.customer);
+    }
+    return res.json({ received: true });
+  } catch (error) {
+    return res.status(400).send(`Webhook Error: ${error.message}`);
+  }
+});
+
+
+app.post("/api/internal/monthly-reset", express.json(), async (req, res) => {
+  const supplied = req.headers["x-internal-secret"];
+  if (!process.env.INTERNAL_CRON_SECRET || supplied !== process.env.INTERNAL_CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized." });
+  }
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database is not configured." });
+  const { error } = await supabaseAdmin
+    .from("profiles")
+    .update({ characters_used: 0, updated_at: new Date().toISOString() })
+    .neq("id", "00000000-0000-0000-0000-000000000000");
+  if (error) return res.status(500).json({ error: "Monthly reset failed." });
+  return res.json({ ok: true });
+});
+
+app.use(express.static(path.join(root, "dist")));
+app.get("*", (_req, res) => res.sendFile(path.join(root, "dist", "index.html")));
+app.listen(port, () => console.log(`Chenie Voice server running on http://localhost:${port}`));
